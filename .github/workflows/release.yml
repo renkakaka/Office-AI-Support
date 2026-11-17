@@ -2,39 +2,86 @@ name: Build Windows release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: office-ai-support-release
+  cancel-in-progress: false
+
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Reassemble source archive
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem "bundle/office_ai_support_source.tar.gz.part*" | Sort-Object Name
+          if ($parts.Count -ne 8) { throw "Expected 8 source archive parts, found $($parts.Count)" }
+          $archive = Join-Path $env:RUNNER_TEMP "office_ai_support_source.tar.gz"
+          $stream = [System.IO.File]::Create($archive)
+          try {
+            foreach ($part in $parts) {
+              $bytes = [System.IO.File]::ReadAllBytes($part.FullName)
+              $stream.Write($bytes, 0, $bytes.Length)
+            }
+          }
+          finally {
+            $stream.Dispose()
+          }
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "Source archive SHA-256: $actual"
+          New-Item -ItemType Directory -Path source -Force | Out-Null
+          tar -xzf $archive -C source
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
+        working-directory: source
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-      - name: Build Windows executable
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name OfficeAISupport main.py
-      - name: Generate SHA-256 checksum
-        shell: pwsh
+
+      - name: Run tests
+        working-directory: source
         run: |
+          python -m py_compile main.py core/*.py
+          python -m unittest discover -s tests -v
+
+      - name: Build Windows executable
+        working-directory: source
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name OfficeAISupport main.py
+
+      - name: Generate SHA-256 checksum and release version
+        id: metadata
+        shell: pwsh
+        working-directory: source
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if (-not $version) { throw "VERSION file is empty" }
           $hash = (Get-FileHash dist/OfficeAISupport.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  OfficeAISupport.exe" | Out-File -Encoding ascii dist/OfficeAISupport.exe.sha256
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.metadata.outputs.version }}
+          target_commitish: main
+          name: Office AI Support v${{ steps.metadata.outputs.version }}
           generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
           files: |
-            dist/OfficeAISupport.exe
-            dist/OfficeAISupport.exe.sha256
+            source/dist/OfficeAISupport.exe
+            source/dist/OfficeAISupport.exe.sha256
